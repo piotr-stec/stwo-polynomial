@@ -42,9 +42,20 @@ cargo run --example verify_fibonacci
 
 ## Installation
 
+### 1. Set up Rust toolchain
+
+Create a `rust-toolchain.toml` file in your project root:
+
+```toml
+[toolchain]
+channel = "nightly-2025-04-06"
+```
+
+### 2. Add dependency
+
 Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-stwo-polynomial = { git = "https://github.com/your-repo/stwo-polynomial" }
+stwo-polynomial = { git = "https://github.com/piotr-stec/stwo-polynomial" }
 ```
