@@ -44,13 +44,15 @@
 
 use std::ops::{Add, AddAssign, Mul, Sub};
 
+use stwo::core::channel::{KeccakChannel, Channel};
+use stwo::core::vcs::keccak_merkle::{KeccakMerkleChannel, KeccakMerkleHasher};
 use stwo_constraint_framework::relation;
 
 
 // pub use computing::{MerkleComputingComponent, MerkleComputingEval};
 use num_traits::Zero;
 // pub use scheduler::{MerkleSchedulerComponent, MerkleSchedulerEval};
-use stwo::core::channel::{Blake2sChannel, Channel};
+// use stwo::core::channel::{Blake2sChannel, Channel, KeccakChannel};
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::fields::FieldExpOps;
@@ -355,7 +357,7 @@ pub struct MerkleStatement0 {
 }
 
 impl MerkleStatement0 {
-    pub fn mix_into(&self, channel: &mut Blake2sChannel) {
+    pub fn mix_into(&self, channel: &mut KeccakChannel) {
         channel.mix_u64(self.log_size as u64);
         channel.mix_u64(self.depth as u64);
     }
@@ -396,7 +398,7 @@ pub struct MerkleStatement1 {
 }
 
 impl MerkleStatement1 {
-    pub fn mix_into(&self, channel: &mut Blake2sChannel) {
+    pub fn mix_into(&self, channel: &mut KeccakChannel) {
         // Mix expected_root as public input (single value)
         channel.mix_felts(&[SecureField::from(self.expected_root)]);
         // Mix claimed sums
@@ -430,11 +432,11 @@ pub fn prove_merkle(
     siblings: Vec<BaseField>, // KKRT: Vec of single M31 values
     index: u32,
     expected_root: BaseField, // KKRT: Single M31 value
-    channel: &mut Blake2sChannel,
-    mut commitment_scheme: CommitmentSchemeProver<SimdBackend, Blake2sMerkleChannel>,
+    channel: &mut KeccakChannel,
+    mut commitment_scheme: CommitmentSchemeProver<SimdBackend, KeccakMerkleChannel>,
 ) -> Result<
     (
-        StarkProof<Blake2sMerkleHasher>,
+        StarkProof<KeccakMerkleHasher>,
         MerkleComputingComponent,
         MerkleSchedulerComponent,
         MerkleStatement0,
@@ -597,7 +599,7 @@ pub fn prove_merkle(
 /// # Returns
 /// * Result indicating success or failure
 pub fn verify_merkle(
-    proof: StarkProof<Blake2sMerkleHasher>,
+    proof: StarkProof<KeccakMerkleHasher>,
     depth: usize,
     statement0: MerkleStatement0,
     statement1: MerkleStatement1,
@@ -614,8 +616,8 @@ pub fn verify_merkle(
 
     // Step 1: Setup verifier channel and commitment scheme
     println!("Step 1: Setting up verifier...");
-    let channel = &mut Blake2sChannel::default();
-    let commitment_scheme = &mut CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(config);
+    let channel = &mut KeccakChannel::default();
+    let commitment_scheme = &mut CommitmentSchemeVerifier::<KeccakMerkleChannel>::new(config);
     let log_sizes = statement0.log_sizes();
 
     // Step 2: Commit preprocessed columns

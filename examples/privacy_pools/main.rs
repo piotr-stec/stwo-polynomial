@@ -5,12 +5,12 @@ mod trace_gen;
 mod utils;
 
 use mixer::full_flow::{generate_operation, compute_commitment, HybridMerkleTree};
-use stwo::core::channel::Blake2sChannel;
+use stwo::core::channel::KeccakChannel;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
 use stwo::core::poly::circle::CanonicCoset;
-use stwo::core::vcs::blake2_merkle::Blake2sMerkleChannel;
+use stwo::core::vcs::keccak_merkle::KeccakMerkleChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::CommitmentSchemeProver;
 use utils::{prove_merkle, verify_merkle};
@@ -118,12 +118,11 @@ fn run_complete_privacy_mixer_flow() {
         fri_config: FriConfig::new(2, 2, 70),
     };
     println!("Security bits: {}", config.security_bits());
-    let channel = &mut Blake2sChannel::default();
+    let channel = &mut KeccakChannel::default();
     let twiddles =
         SimdBackend::precompute_twiddles(CanonicCoset::new(20).circle_domain().half_coset);
     let commitment_scheme =
-        CommitmentSchemeProver::<SimdBackend, Blake2sMerkleChannel>::new(config, &twiddles);
-
+        CommitmentSchemeProver::<SimdBackend, KeccakMerkleChannel>::new(config, &twiddles);
     // Generate STARK proof for membership
     println!("Generating STARK proof...");
     let (proof, _, _, statement0, statement1, composition_polynomial) = prove_merkle(
