@@ -44,9 +44,11 @@
 
 use std::ops::{Add, AddAssign, Mul, Sub};
 
+use stwo::core::air::{Component, Components};
 use stwo::core::channel::{KeccakChannel, Channel};
+use stwo::core::vcs::keccak_hash::KeccakHash;
 use stwo::core::vcs::keccak_merkle::{KeccakMerkleChannel, KeccakMerkleHasher};
-use stwo_constraint_framework::relation;
+use stwo_constraint_framework::{FrameworkComponent, InfoEvaluator, PREPROCESSED_TRACE_IDX, relation};
 
 
 // pub use computing::{MerkleComputingComponent, MerkleComputingEval};
@@ -69,6 +71,7 @@ use stwo::prover::CommitmentSchemeProver;
 use stwo_polynomial::prove::prove;
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 use stwo_constraint_framework::TraceLocationAllocator;
+use crate::ComponentInfo;
 pub use crate::trace_gen::{
     gen_merkle_computing_interaction_trace, gen_merkle_computing_trace,
     gen_merkle_scheduler_interaction_trace, gen_merkle_scheduler_trace,
@@ -605,7 +608,7 @@ pub fn verify_merkle(
     statement1: MerkleStatement1,
     config: stwo::core::pcs::PcsConfig,
     composition_polynomial: SecureCirclePoly<SimdBackend>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(KeccakHash, FrameworkComponent<MerkleComputingEval>, FrameworkComponent<MerkleSchedulerEval>, Vec<KeccakHash>, Vec<Vec<u32>>, u32), Box<dyn std::error::Error>> { // digest, mask offsets for each component, roots, log sizes
     use stwo::core::pcs::CommitmentSchemeVerifier;
 
     println!("\n=== Merkle Proof Verification ===");
@@ -619,6 +622,10 @@ pub fn verify_merkle(
     let channel = &mut KeccakChannel::default();
     let commitment_scheme = &mut CommitmentSchemeVerifier::<KeccakMerkleChannel>::new(config);
     let log_sizes = statement0.log_sizes();
+    println!(
+        "Log sizes for trees: {:?}",
+        log_sizes.0.iter().map(|v| v[0]).collect::<Vec<u32>>()
+    );
 
     // Step 2: Commit preprocessed columns
     println!("\nStep 2: Committing preprocessed columns...");
@@ -641,6 +648,21 @@ pub fn verify_merkle(
     // Step 5: Commit interaction traces
     println!("\nStep 5: Committing interaction traces...");
     commitment_scheme.commit(proof.commitments[2], &log_sizes[2], channel);
+
+
+    // log_size + proof.config.fri_config.log_blowup_factor
+    let extended_log_sizes: Vec<Vec<u32>> = log_sizes
+            .iter()
+            .map(|log_size| {
+                log_size
+                    .iter()
+                    .map(|&ls| ls + proof.config.fri_config.log_blowup_factor)
+                    .collect()
+            })
+            .collect();
+    println!("Extended log sizes for FRI: {:?}", extended_log_sizes);
+
+
 
     // Step 6: Create components (AFTER committing interaction traces, matching prover order)
     println!("\nStep 6: Creating components for verification...");
@@ -673,18 +695,36 @@ pub fn verify_merkle(
         statement1.claimed_sum_scheduler,
     );
 
-    // Step 7: Verify the proof
+    let digest = channel.digest();
+    println!("Channel before verify: {:?}", channel);
+
+  // Step 7: Verify the proof
     println!("\nStep 7: Verifying STARK proof...");
     stwo_polynomial::verify::verify(
         &[&component_computing, &component_scheduler],
         channel,
         commitment_scheme,
-        proof,
+        proof.clone(),
         composition_polynomial,
     )?;
     println!("✅ Proof verified successfully!");
 
-    Ok(())
+       let n_preprocessed_columns = commitment_scheme.trees[PREPROCESSED_TRACE_IDX]
+        .column_log_sizes
+        .len();
+  let components_vec: Vec<&dyn Component> = vec![
+      &component_computing as &dyn Component,
+      &component_scheduler as &dyn Component,
+  ];  
+
+    let components = Components {
+        components: components_vec,
+        n_preprocessed_columns,
+    };
+
+    let components_log_degree_bound = components.composition_log_degree_bound();
+
+    Ok((digest, component_computing, component_scheduler, vec![proof.commitments[0], proof.commitments[1], proof.commitments[2]], extended_log_sizes, components_log_degree_bound))
 }
 
 /// Helper structure to represent a complete Merkle tree
