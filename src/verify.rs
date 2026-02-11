@@ -1,24 +1,23 @@
-use std_shims::vec;
-use stwo::core::air::{Component, Components};
-use stwo::core::channel::{Channel, MerkleChannel};
-use stwo::core::circle::CirclePoint;
-use stwo::core::fields::qm31::{SecureField, SECURE_EXTENSION_DEGREE};
-use stwo::core::pcs::CommitmentSchemeVerifier;
-use stwo::core::proof::StarkProof;
-use stwo::core::verifier::VerificationError;
-use stwo::prover::backend::BackendForChannel;
-use stwo::prover::poly::circle::SecureCirclePoly;
-
-use crate::prove::extract_composition_oods_eval;
+use stwo_prover::core::air::{Component, Components};
+use stwo_prover::core::backend::BackendForChannel;
+use stwo_prover::core::channel::{Channel, MerkleChannel};
+use stwo_prover::core::circle::CirclePoint;
+use stwo_prover::core::fields::qm31::{SecureField, SECURE_EXTENSION_DEGREE};
+use stwo_prover::core::pcs::{CommitmentSchemeVerifier, TreeVec};
+use stwo_prover::core::poly::circle::SecureCirclePoly;
+use stwo_prover::core::prover::{StarkProof, VerificationError};
+use stwo_prover::core::queries::QueriesWithBranching;
+use stwo_prover::core::ColumnVec;
+use tracing::instrument;
 pub const PREPROCESSED_TRACE_IDX: usize = 0;
 
-pub fn verify<B: BackendForChannel<MC>, MC: MerkleChannel>(
+pub fn verify_with_queries<B: BackendForChannel<MC>, MC: MerkleChannel>(
     components: &[&dyn Component],
     channel: &mut MC::C,
     commitment_scheme: &mut CommitmentSchemeVerifier<MC>,
     proof: StarkProof<MC::H>,
     composition_polynomial: SecureCirclePoly<B>,
-) -> Result<(), VerificationError> {
+) -> Result<(QueriesWithBranching, TreeVec<ColumnVec<u32>>), VerificationError> {
     let n_preprocessed_columns = commitment_scheme.trees[PREPROCESSED_TRACE_IDX]
         .column_log_sizes
         .len();
@@ -27,11 +26,7 @@ pub fn verify<B: BackendForChannel<MC>, MC: MerkleChannel>(
         components: components.to_vec(),
         n_preprocessed_columns,
     };
-    tracing::info!(
-        "Composition polynomial log degree bound: {}",
-        components.composition_log_degree_bound()
-    );
-    let _random_coeff = channel.draw_secure_felt();
+    let random_coeff = channel.draw_felt();
 
     // Read composition polynomial commitment.
     commitment_scheme.commit(
@@ -48,25 +43,13 @@ pub fn verify<B: BackendForChannel<MC>, MC: MerkleChannel>(
     // Add the composition polynomial mask points.
     sample_points.push(vec![vec![oods_point]; SECURE_EXTENSION_DEGREE]);
 
-    let sample_points_by_column = sample_points.as_cols_ref().flatten();
-    tracing::info!("Sampling {} columns.", sample_points_by_column.len());
-    tracing::info!(
-        "Total sample points: {}.",
-        sample_points_by_column.into_iter().flatten().count()
-    );
+    let composition_oods_eval = proof.extract_composition_oods_eval().map_err(|_| {
+        VerificationError::InvalidStructure("Unexpected sampled_values structure".to_string())
+    })?;
 
-    let composition_oods_eval = extract_composition_oods_eval::<MC>(&proof)
-            .ok_or(VerificationError::InvalidStructure(
-                std_shims::ToString::to_string(&"Unexpected sampled_values structure"),
-            ))?;
-
-    if composition_oods_eval
-        != composition_polynomial.eval_at_point(oods_point)
-    {
+    if composition_oods_eval != composition_polynomial.eval_at_point(oods_point) {
         return Err(VerificationError::OodsNotMatching);
     }
 
     commitment_scheme.verify_values(sample_points, proof.0, channel)
 }
-
-

@@ -28,11 +28,10 @@ name = "fibonacci_onchain"
 path = "examples/fibonacci_onchain/main.rs"
 
 [dependencies]
-stwo = { git = "https://github.com/piotr-stec/stwo-fork-keccak", features = ["prover"], branch = "channel/solidity" }
-std-shims = { git = "https://github.com/piotr-stec/stwo-fork-keccak", features = ["std"],branch = "channel/solidity"  }
-stwo-constraint-framework = { git = "https://github.com/piotr-stec/stwo-fork-keccak", features = ["prover", "std"], branch = "channel/solidity" }
+stwo-prover = { git = "https://github.com/piotr-stec/stwo-fork-keccak", branch = "feat/gnark" }
+
 num-traits = "0.2"
-thiserror = { version = "2.0.12", default-features = false }
+thiserror = { version = "1.0.56" }
 tracing = { version = "0.1.40", default-features = false }
 tracing-subscriber = { version = "0.3.18", default-features = false }
 serde = { version = "1.0", features = ["derive"] }

@@ -1,20 +1,24 @@
-use stwo::prover::poly::circle::SecureCirclePoly;
-use stwo::prover::{CommitmentSchemeProver, ComponentProver, ComponentProvers, ProvingError};
-use tracing::{info, span, Level};
-
-use stwo::core::channel::{Channel, MerkleChannel};
-use stwo::core::circle::CirclePoint;
-use stwo::core::fields::qm31::{SecureField, SECURE_EXTENSION_DEGREE};
-use stwo::core::proof::StarkProof;
-use stwo::core::verifier::PREPROCESSED_TRACE_IDX;
-use stwo::prover::backend::BackendForChannel;
-
-// pub use air::component_prover::{ComponentProver, ComponentProvers, Trace};
-// pub use air::{AccumulationOps, ColumnAccumulator, DomainEvaluationAccumulator};
-// pub use pcs::quotient_ops::QuotientOps;
-// pub use pcs::{CommitmentSchemeProver, CommitmentTreeProver, TreeBuilder};
-
-
+use stwo_prover::constraint_framework::PREPROCESSED_TRACE_IDX;
+use stwo_prover::core::air::{Component, ComponentProver, ComponentProvers, Components};
+use stwo_prover::core::backend::BackendForChannel;
+use stwo_prover::core::channel::{Channel, MerkleChannel};
+use stwo_prover::core::circle::CirclePoint;
+use stwo_prover::core::fields::m31::BaseField;
+use stwo_prover::core::fields::qm31::SecureField;
+use stwo_prover::core::fields::secure_column::SECURE_EXTENSION_DEGREE;
+use stwo_prover::core::fri::{FriLayerProof, FriProof, FriVerificationError};
+use stwo_prover::core::pcs::{
+    CommitmentSchemeProof, CommitmentSchemeProver, CommitmentSchemeVerifier,
+};
+use stwo_prover::core::poly::circle::SecureCirclePoly;
+use stwo_prover::core::prover::{ProvingError, StarkProof};
+use stwo_prover::core::queries::QueriesWithBranching;
+use stwo_prover::core::vcs::hash::Hash;
+use stwo_prover::core::vcs::ops::MerkleHasher;
+use stwo_prover::core::vcs::prover::MerkleDecommitment;
+use stwo_prover::core::vcs::verifier::MerkleVerificationError;
+use tracing::{instrument, span, Level};
+#[instrument(skip_all)]
 pub fn prove<B: BackendForChannel<MC>, MC: MerkleChannel>(
     components: &[&dyn ComponentProver<B>],
     channel: &mut MC::C,
@@ -30,7 +34,7 @@ pub fn prove<B: BackendForChannel<MC>, MC: MerkleChannel>(
     let trace = commitment_scheme.trace();
 
     // Evaluate and commit on composition polynomial.
-    let random_coeff = channel.draw_secure_felt();
+    let random_coeff = channel.draw_felt();
 
     let span = span!(Level::INFO, "Composition", class = "Composition").entered();
     let span1 = span!(
@@ -39,8 +43,10 @@ pub fn prove<B: BackendForChannel<MC>, MC: MerkleChannel>(
         class = "CompositionPolynomialGeneration"
     )
     .entered();
-    let composition_poly= component_provers.compute_composition_polynomial(random_coeff, &trace);
-    let compostion_polynomial_to_return = component_provers.compute_composition_polynomial(random_coeff, &trace);
+    let composition_poly = component_provers.compute_composition_polynomial(random_coeff, &trace);
+    let compostion_polynomial_to_return =
+        component_provers.compute_composition_polynomial(random_coeff, &trace);
+
     span1.exit();
 
     let mut tree_builder = commitment_scheme.tree_builder();
@@ -60,11 +66,10 @@ pub fn prove<B: BackendForChannel<MC>, MC: MerkleChannel>(
     // Prove the trace and composition OODS values, and retrieve them.
     let commitment_scheme_proof = commitment_scheme.prove_values(sample_points, channel);
     let proof = StarkProof(commitment_scheme_proof);
-    info!(proof_size_estimate = proof.size_estimate());
 
     // Evaluate composition polynomial at OODS point and check that it matches the trace OODS
     // values. This is a sanity check.
-    if extract_composition_oods_eval::<MC>(&proof).unwrap()
+    if proof.extract_composition_oods_eval().unwrap()
         != component_provers
             .components()
             .eval_composition_polynomial_at_point(oods_point, &proof.sampled_values, random_coeff)
@@ -73,27 +78,4 @@ pub fn prove<B: BackendForChannel<MC>, MC: MerkleChannel>(
     }
 
     Ok((proof, compostion_polynomial_to_return))
-}
-
-
-pub fn extract_composition_oods_eval<MC: MerkleChannel>(
-    proof: &StarkProof<MC::H>,
-) -> Option<SecureField> {
-    // TODO(andrew): `[.., composition_mask, _quotients_mask]` when add quotients
-    // commitment.
-    let [.., composition_mask] = &**proof.sampled_values else {
-        return None;
-    };
-    let coordinate_evals = composition_mask
-        .iter()
-        .map(|columns| {
-            let &[eval] = &columns[..] else {
-                return None;
-            };
-            Some(eval)
-        })
-        .collect::<Option<Vec<_>>>()?
-        .try_into()
-        .ok()?;
-    Some(SecureField::from_partial_evals(coordinate_evals))
 }
