@@ -8,7 +8,6 @@ use stwo_prover::core::poly::circle::SecureCirclePoly;
 use stwo_prover::core::prover::{StarkProof, VerificationError};
 use stwo_prover::core::queries::QueriesWithBranching;
 use stwo_prover::core::ColumnVec;
-use tracing::instrument;
 pub const PREPROCESSED_TRACE_IDX: usize = 0;
 
 pub fn verify_with_queries<B: BackendForChannel<MC>, MC: MerkleChannel>(
@@ -26,7 +25,7 @@ pub fn verify_with_queries<B: BackendForChannel<MC>, MC: MerkleChannel>(
         components: components.to_vec(),
         n_preprocessed_columns,
     };
-    let random_coeff = channel.draw_felt();
+    let _random_coeff = channel.draw_felt();
 
     // Read composition polynomial commitment.
     commitment_scheme.commit(

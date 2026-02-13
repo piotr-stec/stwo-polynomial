@@ -1,24 +1,16 @@
 use stwo_prover::constraint_framework::PREPROCESSED_TRACE_IDX;
-use stwo_prover::core::air::{Component, ComponentProver, ComponentProvers, Components};
+use stwo_prover::core::air::{ComponentProver, ComponentProvers};
 use stwo_prover::core::backend::BackendForChannel;
 use stwo_prover::core::channel::{Channel, MerkleChannel};
 use stwo_prover::core::circle::CirclePoint;
-use stwo_prover::core::fields::m31::BaseField;
 use stwo_prover::core::fields::qm31::SecureField;
 use stwo_prover::core::fields::secure_column::SECURE_EXTENSION_DEGREE;
-use stwo_prover::core::fri::{FriLayerProof, FriProof, FriVerificationError};
 use stwo_prover::core::pcs::{
-    CommitmentSchemeProof, CommitmentSchemeProver, CommitmentSchemeVerifier,
+ CommitmentSchemeProver, 
 };
 use stwo_prover::core::poly::circle::SecureCirclePoly;
 use stwo_prover::core::prover::{ProvingError, StarkProof};
-use stwo_prover::core::queries::QueriesWithBranching;
-use stwo_prover::core::vcs::hash::Hash;
-use stwo_prover::core::vcs::ops::MerkleHasher;
-use stwo_prover::core::vcs::prover::MerkleDecommitment;
-use stwo_prover::core::vcs::verifier::MerkleVerificationError;
-use tracing::{instrument, span, Level};
-#[instrument(skip_all)]
+
 pub fn prove<B: BackendForChannel<MC>, MC: MerkleChannel>(
     components: &[&dyn ComponentProver<B>],
     channel: &mut MC::C,
@@ -36,23 +28,15 @@ pub fn prove<B: BackendForChannel<MC>, MC: MerkleChannel>(
     // Evaluate and commit on composition polynomial.
     let random_coeff = channel.draw_felt();
 
-    let span = span!(Level::INFO, "Composition", class = "Composition").entered();
-    let span1 = span!(
-        Level::INFO,
-        "Generation",
-        class = "CompositionPolynomialGeneration"
-    )
-    .entered();
+
     let composition_poly = component_provers.compute_composition_polynomial(random_coeff, &trace);
     let compostion_polynomial_to_return =
         component_provers.compute_composition_polynomial(random_coeff, &trace);
 
-    span1.exit();
 
     let mut tree_builder = commitment_scheme.tree_builder();
     tree_builder.extend_polys(composition_poly.into_coordinate_polys());
     tree_builder.commit(channel);
-    span.exit();
 
     // Draw OODS point.
     let oods_point = CirclePoint::<SecureField>::get_random_point(channel);
