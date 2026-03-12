@@ -3,25 +3,27 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use alloy::{hex, sol};
-use num_traits::Zero;
+use num_traits::{One, Zero};
 use stwo::core::air::Component;
-use stwo::core::channel::KeccakChannel;
+use stwo::core::channel::{Channel, KeccakChannel};
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::fri::FriConfig as StwoFriConfig;
 use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig};
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::proof::StarkProof;
-use stwo::core::utils::bit_reverse;
+use stwo::core::utils::{bit_reverse, bit_reverse_coset_to_circle_domain_order};
 use stwo::core::vcs::keccak_merkle::{KeccakMerkleChannel, KeccakMerkleHasher};
+use stwo::core::verifier::VerificationError;
 use stwo::core::ColumnVec;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::{Col, Column};
 use stwo::prover::poly::circle::{CircleEvaluation, PolyOps, SecureCirclePoly};
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::CommitmentSchemeProver;
+use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 use stwo_constraint_framework::{
-    EvalAtRow, FrameworkComponent, FrameworkEval, TraceLocationAllocator,
+    EvalAtRow, FrameworkComponent, FrameworkEval, TraceLocationAllocator, ORIGINAL_TRACE_IDX,
 };
 use stwo_polynomial::prove::prove;
 use stwo_polynomial::verify::verify;
@@ -119,94 +121,191 @@ sol! {
         function verify(
             Proof calldata proof,
             VerificationParams calldata params,
-            bytes32[] memory treeRoots,
             uint32[][] memory treeColumnLogSizes,
-            bytes32 digest,
-            uint32 nDraws
+            uint64[] calldata publicInputs
         ) external view returns (bool);
     }
 }
 
-#[derive(Clone)]
-pub struct FibonacciEval {
-    pub log_n_rows: u32,
+pub const LOG_CONSTRAINT_DEGREE: u32 = 1;
+
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub struct FibStatement0 {
+    pub log_size: u32,
+    pub fibonacci_index: usize,
+    // Public inputs (initial values in first row):
+    pub initial_a: u32,
+    pub initial_b: u32,
+    // Public output (value at fibonacci_index):
+    pub expected_value: u32,
 }
 
-impl FrameworkEval for FibonacciEval {
+impl FibStatement0 {
+    pub fn mix_into(&self, channel: &mut impl Channel) {
+        channel.mix_u64(self.log_size as u64);
+        channel.mix_u64(self.fibonacci_index as u64);
+        channel.mix_u64(self.initial_a as u64);
+        channel.mix_u64(self.initial_b as u64);
+        channel.mix_u64(self.expected_value as u64);
+    }
+}
+
+pub fn gen_is_first_column(
+    log_size: u32,
+) -> CircleEvaluation<SimdBackend, BaseField, BitReversedOrder> {
+    let n_rows = 1 << log_size;
+    let mut col = Col::<SimdBackend, BaseField>::zeros(n_rows);
+    col.set(0, BaseField::from_u32_unchecked(1));
+
+    bit_reverse_coset_to_circle_domain_order(col.as_mut_slice());
+    CircleEvaluation::new(CanonicCoset::new(log_size).circle_domain(), col)
+}
+
+pub fn is_first_column_id(log_size: u32) -> PreProcessedColumnId {
+    PreProcessedColumnId {
+        id: format!("is_first_{}", log_size),
+    }
+}
+
+pub fn gen_is_target_column(
+    log_size: u32,
+    index: usize,
+) -> CircleEvaluation<SimdBackend, BaseField, BitReversedOrder> {
+    let n_rows = 1 << log_size;
+
+    assert!(
+        index < n_rows,
+        "fibonacci_index ({}) must be less than n_rows (2^{} = {})",
+        index,
+        log_size,
+        n_rows
+    );
+
+    let mut col = Col::<SimdBackend, BaseField>::zeros(n_rows);
+    col.set(index, BaseField::one());
+
+    bit_reverse_coset_to_circle_domain_order(col.as_mut_slice());
+    CircleEvaluation::new(CanonicCoset::new(log_size).circle_domain(), col)
+}
+
+pub fn is_target_column_id(log_size: u32) -> PreProcessedColumnId {
+    PreProcessedColumnId {
+        id: format!("is_target_{}", log_size),
+    }
+}
+
+#[derive(Clone)]
+pub struct FibEval {
+    pub log_n_rows: u32,
+    pub is_first_id: PreProcessedColumnId,
+    pub is_target_id: PreProcessedColumnId,
+    pub initial_a: BaseField,
+    pub initial_b: BaseField,
+    pub expected_value: BaseField,
+}
+
+impl FrameworkEval for FibEval {
     fn log_size(&self) -> u32 {
         self.log_n_rows
     }
 
     fn max_constraint_log_degree_bound(&self) -> u32 {
-        self.log_n_rows + 1
+        self.log_n_rows + LOG_CONSTRAINT_DEGREE
     }
 
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
-        let a = eval.next_trace_mask(); // f(n-2)
-        let b = eval.next_trace_mask(); // f(n-1)
-        let c = eval.next_trace_mask(); // f(n)
+        let is_first = eval.get_preprocessed_column(self.is_first_id.clone());
+        let is_target = eval.get_preprocessed_column(self.is_target_id.clone());
 
-        eval.add_constraint(c - (a + b));
+        let [a_curr, _a_prev] = eval.next_interaction_mask(ORIGINAL_TRACE_IDX, [0, -1]);
+        let [b_curr, b_prev] = eval.next_interaction_mask(ORIGINAL_TRACE_IDX, [0, -1]);
+        let [c_curr, c_prev] = eval.next_interaction_mask(ORIGINAL_TRACE_IDX, [0, -1]);
+
+        // Fibonacci relation c = a + b
+        eval.add_constraint(c_curr.clone() - (a_curr.clone() + b_curr.clone()));
+
+        // Transition a_curr = b_prev (disabled for first row)
+        let not_first = E::F::one() - is_first.clone();
+        eval.add_constraint(not_first.clone() * (a_curr.clone() - b_prev));
+
+        // Transition b_curr = c_prev (disabled for first row)
+        eval.add_constraint(not_first.clone() * (b_curr.clone() - c_prev));
+
+        // Public inputs at first row
+        eval.add_constraint(is_first.clone() * (a_curr.clone() - E::F::from(self.initial_a)));
+        eval.add_constraint(is_first.clone() * (b_curr.clone() - E::F::from(self.initial_b)));
+
+        // Public output at target row
+        eval.add_constraint(is_target * (a_curr - E::F::from(self.expected_value)));
 
         eval
     }
 }
 
-pub type FibonacciComponent = FrameworkComponent<FibonacciEval>;
+pub type FibComponent = FrameworkComponent<FibEval>;
 
-/// Calculate the minimum log_size needed to compute f(target_n)
-pub fn calculate_log_size(target_n: usize) -> u32 {
-    let min_rows = target_n.saturating_sub(1).max(1);
+/// Calculate the minimum log_size needed to include fibonacci_index row
+pub fn calculate_log_size(fibonacci_index: usize) -> u32 {
+    let min_rows = fibonacci_index.saturating_add(1).max(1);
     let log_size = (min_rows as f64).log2().ceil() as u32;
     log_size.max(2)
 }
 
-/// Generate trace for fibonacci sequence
-pub fn gen_fibonacci_trace(
-    target_n: usize,
+/// Generate trace for Fibonacci sequence with public inputs
+pub fn gen_fib_trace(
+    log_size: u32,
+    fibonacci_index: usize,
+    initial_a: u32,
+    initial_b: u32,
 ) -> (
     ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
-    BaseField,
     u32,
 ) {
-    let log_size = calculate_log_size(target_n);
     let n_rows = 1 << log_size;
+
+    assert!(
+        fibonacci_index < n_rows,
+        "fibonacci_index ({}) must be less than n_rows ({})",
+        fibonacci_index,
+        n_rows
+    );
 
     let mut col_a = Col::<SimdBackend, BaseField>::zeros(n_rows);
     let mut col_b = Col::<SimdBackend, BaseField>::zeros(n_rows);
     let mut col_c = Col::<SimdBackend, BaseField>::zeros(n_rows);
 
-    let mut a = BaseField::from_u32_unchecked(0);
-    let mut b = BaseField::from_u32_unchecked(1);
-    let mut target_value = BaseField::from_u32_unchecked(0);
+    let mut a = BaseField::from_u32_unchecked(initial_a);
+    let mut b = BaseField::from_u32_unchecked(initial_b);
+    let mut target_value = 0u32;
 
-    let compute_rows = (target_n - 1).min(n_rows);
-
-    for row in 0..compute_rows {
+    for row in 0..n_rows {
         let c = a + b;
 
         col_a.set(row, a);
         col_b.set(row, b);
         col_c.set(row, c);
 
-        let current_index = row + 2;
-        if current_index == target_n {
-            target_value = c;
+        if row == fibonacci_index {
+            target_value = a.0;
         }
 
         a = b;
         b = c;
     }
 
+    bit_reverse_coset_to_circle_domain_order(col_a.as_mut_slice());
+    bit_reverse_coset_to_circle_domain_order(col_b.as_mut_slice());
+    bit_reverse_coset_to_circle_domain_order(col_c.as_mut_slice());
+
     let domain = CanonicCoset::new(log_size).circle_domain();
-
-    let trace = vec![
-        CircleEvaluation::new(domain, col_a),
-        CircleEvaluation::new(domain, col_b),
-        CircleEvaluation::new(domain, col_c),
-    ];
-
-    (trace, target_value, log_size)
+    (
+        vec![
+            CircleEvaluation::new(domain.clone(), col_a),
+            CircleEvaluation::new(domain.clone(), col_b),
+            CircleEvaluation::new(domain, col_c),
+        ],
+        target_value,
+    )
 }
 
 /// Recreate Solidity abi.encodePacked for decommitment
@@ -428,13 +527,226 @@ fn convert_to_solidity_proof(
     }
 }
 
+#[derive(Clone)]
+pub struct ProofData {
+    fib_stmt0: FibStatement0,
+    stark_proof: StarkProof<KeccakMerkleHasher>,
+}
+
+struct OffchainArtifacts {
+    digest: FixedBytes<32>,
+    component: FibComponent,
+    log_sizes: Vec<Vec<u32>>,
+    composition_log_degree_bound: u32,
+}
+
+fn prove_fibonacci(
+    log_size: u32,
+    fibonacci_index: usize,
+    initial_a: u32,
+    initial_b: u32,
+    config: PcsConfig,
+) -> Result<(ProofData, SecureCirclePoly<SimdBackend>), Box<dyn std::error::Error>> {
+    let (trace, expected_value) = gen_fib_trace(log_size, fibonacci_index, initial_a, initial_b);
+    let fib_is_first_col = gen_is_first_column(log_size);
+    let fib_is_target_col = gen_is_target_column(log_size, fibonacci_index);
+
+    let twiddles = SimdBackend::precompute_twiddles(
+        CanonicCoset::new(log_size + 1 + config.fri_config.log_blowup_factor)
+            .circle_domain()
+            .half_coset,
+    );
+
+    let prover_channel = &mut KeccakChannel::default();
+    let mut commitment_scheme =
+        CommitmentSchemeProver::<SimdBackend, KeccakMerkleChannel>::new(config, &twiddles);
+
+    let fib_stmt0 = FibStatement0 {
+        log_size,
+        fibonacci_index,
+        initial_a,
+        initial_b,
+        expected_value,
+    };
+    fib_stmt0.mix_into(prover_channel);
+
+    let mut tree_builder = commitment_scheme.tree_builder();
+    tree_builder.extend_evals([fib_is_first_col.clone(), fib_is_target_col.clone()]);
+    tree_builder.commit(prover_channel);
+
+    let mut tree_builder = commitment_scheme.tree_builder();
+    tree_builder.extend_evals(trace.clone());
+    tree_builder.commit(prover_channel);
+
+    let all_preprocessed_columns =
+        vec![is_first_column_id(log_size), is_target_column_id(log_size)];
+    let mut tree_span_provider =
+        TraceLocationAllocator::new_with_preprocessed_columns(&all_preprocessed_columns);
+    let fib_component = FibComponent::new(
+        &mut tree_span_provider,
+        FibEval {
+            log_n_rows: log_size,
+            is_first_id: is_first_column_id(log_size),
+            is_target_id: is_target_column_id(log_size),
+            initial_a: BaseField::from_u32_unchecked(initial_a),
+            initial_b: BaseField::from_u32_unchecked(initial_b),
+            expected_value: BaseField::from_u32_unchecked(expected_value),
+        },
+        SecureField::zero(),
+    );
+
+    let (proof, composition_polynomial) =
+        prove(&[&fib_component], prover_channel, commitment_scheme)?;
+
+    Ok((
+        ProofData {
+            fib_stmt0,
+            stark_proof: proof,
+        },
+        composition_polynomial,
+    ))
+}
+
+fn verify_proof_offchain(
+    proof_data: &ProofData,
+    composition_polynomial: SecureCirclePoly<SimdBackend>,
+    config: PcsConfig,
+) -> Result<OffchainArtifacts, VerificationError> {
+    let mut channel = KeccakChannel::default();
+    let mut commitment_scheme = CommitmentSchemeVerifier::<KeccakMerkleChannel>::new(config);
+
+    let all_preprocessed_columns = vec![
+        is_first_column_id(proof_data.fib_stmt0.log_size),
+        is_target_column_id(proof_data.fib_stmt0.log_size),
+    ];
+    let mut tree_span_provider =
+        TraceLocationAllocator::new_with_preprocessed_columns(&all_preprocessed_columns);
+    let fib_component = FibComponent::new(
+        &mut tree_span_provider,
+        FibEval {
+            log_n_rows: proof_data.fib_stmt0.log_size,
+            is_first_id: is_first_column_id(proof_data.fib_stmt0.log_size),
+            is_target_id: is_target_column_id(proof_data.fib_stmt0.log_size),
+            initial_a: BaseField::from_u32_unchecked(proof_data.fib_stmt0.initial_a),
+            initial_b: BaseField::from_u32_unchecked(proof_data.fib_stmt0.initial_b),
+            expected_value: BaseField::from_u32_unchecked(proof_data.fib_stmt0.expected_value),
+        },
+        SecureField::zero(),
+    );
+
+    let trace_log_sizes = fib_component.trace_log_degree_bounds();
+
+    proof_data.fib_stmt0.mix_into(&mut channel);
+    commitment_scheme.commit(
+        proof_data.stark_proof.commitments[0],
+        &trace_log_sizes[0],
+        &mut channel,
+    );
+    commitment_scheme.commit(
+        proof_data.stark_proof.commitments[1],
+        &trace_log_sizes[1],
+        &mut channel,
+    );
+
+    let digest = FixedBytes::from(channel.digest().0);
+
+    let n_preprocessed_columns = commitment_scheme.trees[0].column_log_sizes.len();
+    let components = stwo::core::air::Components {
+        components: vec![&fib_component as &dyn Component],
+        n_preprocessed_columns,
+    };
+    let composition_log_degree_bound = components.composition_log_degree_bound();
+
+    verify(
+        &[&fib_component],
+        &mut channel,
+        &mut commitment_scheme,
+        proof_data.stark_proof.clone(),
+        composition_polynomial,
+    )?;
+
+    Ok(OffchainArtifacts {
+        digest,
+        component: fib_component,
+        log_sizes: trace_log_sizes.0.clone(),
+        composition_log_degree_bound,
+    })
+}
+
+fn prepare_onchain_inputs(
+    proof_data: &ProofData,
+    offchain: &OffchainArtifacts,
+    config: PcsConfig,
+) -> (
+    VerificationParams,
+    Vec<Vec<u32>>,
+    Vec<u64>,
+) {
+    let component_info = ComponentInfo {
+        maxConstraintLogDegreeBound: offchain.component.max_constraint_log_degree_bound(),
+        logSize: offchain.component.log_size(),
+        maskOffsets: offchain
+            .component
+            .info
+            .mask_offsets
+            .0
+            .iter()
+            .map(|tree| {
+                tree.iter()
+                    .map(|col| col.iter().map(|&offset| offset as i32).collect())
+                    .collect()
+            })
+            .collect(),
+        preprocessedColumns: offchain
+            .component
+            .info
+            .preprocessed_columns
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| U256::from(idx))
+            .collect(),
+    };
+
+    let verification_params = VerificationParams {
+        componentParams: vec![ComponentParams {
+            logSize: offchain.component.log_size(),
+            claimedSum: QM31 {
+                first: CM31 {
+                    real: offchain.component.claimed_sum().0 .0 .0,
+                    imag: offchain.component.claimed_sum().0 .1 .0,
+                },
+                second: CM31 {
+                    real: offchain.component.claimed_sum().1 .0 .0,
+                    imag: offchain.component.claimed_sum().1 .1 .0,
+                },
+            },
+            info: component_info,
+        }],
+        nPreprocessedColumns: U256::from(offchain.component.info.preprocessed_columns.len()),
+        componentsCompositionLogDegreeBound: offchain.composition_log_degree_bound,
+    };
+
+    let log_sizes: Vec<Vec<u32>> = vec![
+        offchain.log_sizes[0].clone(),
+        offchain.log_sizes[1].clone(),
+    ];
+
+    let public_inputs = vec![
+        proof_data.fib_stmt0.log_size as u64,
+        proof_data.fib_stmt0.fibonacci_index as u64,
+        proof_data.fib_stmt0.initial_a as u64,
+        proof_data.fib_stmt0.initial_b as u64,
+        proof_data.fib_stmt0.expected_value as u64,
+    ];
+
+    (verification_params, log_sizes, public_inputs)
+}
+
 async fn test_contract_verify(
     proof: Proof,
     verification_params: VerificationParams,
-    tree_roots: Vec<FixedBytes<32>>,
     tree_column_log_sizes: Vec<Vec<u32>>,
-    digest: FixedBytes<32>,
-    n_draws: u32,
+    public_inputs: Vec<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("\n🔗 Testing Contract Verify Call");
 
@@ -442,17 +754,15 @@ async fn test_contract_verify(
     let provider = ProviderBuilder::new().on_http(rpc_url.parse()?);
 
     let contract_address =
-        Address::parse_checksummed("0x0DCd1Bf9A1b36cE34237eEaFef220932846BCD82", None)?;
+        Address::parse_checksummed("0x5FbDB2315678afecb367f032d93F642f64180aa3", None)?;
 
     println!("Calling contract verify function...");
 
     let call_data = IStwoVerifier::verifyCall {
         proof,
         params: verification_params,
-        treeRoots: tree_roots,
         treeColumnLogSizes: tree_column_log_sizes,
-        digest,
-        nDraws: n_draws,
+        publicInputs: public_inputs,
     };
 
     let call_input = TransactionRequest::default()
@@ -483,16 +793,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("════════════════════════════════════════════\n");
 
     // Configuration
-    let target_n = 10; // Compute f(10) = 55
-    println!("📝 Computing Fibonacci f({}) using STARK proof\n", target_n);
+    let fibonacci_index = 10; // Compute f(10)
+    let initial_a = 0;
+    let initial_b = 1;
+    println!(
+        "📝 Computing Fibonacci f({}) using STARK proof\n",
+        fibonacci_index
+    );
 
     // ═══════════════════════════════════════════════════════════
     // STEP 1: GENERATE FIBONACCI TRACE
     // ═══════════════════════════════════════════════════════════
     println!("📊 STEP 1: Generate Fibonacci Trace");
-    let (trace, target_value, log_size) = gen_fibonacci_trace(target_n);
+    let log_size = calculate_log_size(fibonacci_index);
+    let (_, target_value) = gen_fib_trace(log_size, fibonacci_index, initial_a, initial_b);
     println!("  Trace size: 2^{} = {} rows", log_size, 1 << log_size);
-    println!("  Target value f({}) = {}", target_n, target_value.0);
+    println!("  Target value f({}) = {}", fibonacci_index, target_value);
     println!("  ✅ Trace generated\n");
 
     // ═══════════════════════════════════════════════════════════
@@ -506,92 +822,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     println!("  Security bits: {}", config.security_bits());
 
-    let twiddles = SimdBackend::precompute_twiddles(
-        CanonicCoset::new(log_size + 1 + config.fri_config.log_blowup_factor)
-            .circle_domain()
-            .half_coset,
-    );
-
-    let channel = &mut KeccakChannel::default();
-    let mut commitment_scheme =
-        CommitmentSchemeProver::<SimdBackend, KeccakMerkleChannel>::new(config, &twiddles);
-
-    // Commit preprocessed (empty for Fibonacci)
-    let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(vec![]);
-    tree_builder.commit(channel);
-
-    // Commit trace
-    let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(trace.clone());
-    tree_builder.commit(channel);
-
-    // Create component
-    let component = FibonacciComponent::new(
-        &mut TraceLocationAllocator::default(),
-        FibonacciEval {
-            log_n_rows: log_size,
-        },
-        SecureField::zero(),
-    );
-
-    let (proof, composition_polynomial) = prove(&[&component], channel, commitment_scheme)?;
+    let (proof_data, composition_polynomial) = prove_fibonacci(
+        log_size,
+        fibonacci_index,
+        initial_a,
+        initial_b,
+        config.clone(),
+    )?;
     println!("  ✅ STARK proof generated\n");
 
     // ═══════════════════════════════════════════════════════════
     // STEP 3: VERIFY PROOF (OFF-CHAIN)
     // ═══════════════════════════════════════════════════════════
     println!("✅ STEP 3: Verify Proof (Off-Chain)");
-
-    let verify_channel = &mut KeccakChannel::default();
-    let mut verify_commitment_scheme =
-        CommitmentSchemeVerifier::<KeccakMerkleChannel>::new(config);
-
-    // Commit preprocessed
-    verify_commitment_scheme.commit(
-        proof.commitments[0],
-        &component.trace_log_degree_bounds()[0],
-        verify_channel,
+    let offchain =
+        verify_proof_offchain(&proof_data, composition_polynomial.clone(), config.clone())?;
+    println!("  Digest: 0x{}", hex::encode(offchain.digest));
+    println!(
+        "  Composition log degree bound: {}",
+        offchain.composition_log_degree_bound
     );
-
-    // Commit trace
-    verify_commitment_scheme.commit(
-        proof.commitments[1],
-        &component.trace_log_degree_bounds()[1],
-        verify_channel,
-    );
-
-    // Get digest before verification
-    let digest = verify_channel.digest();
-
-    // Verify the proof
-    verify(
-        &[&component],
-        verify_channel,
-        &mut verify_commitment_scheme,
-        proof.clone(),
-        composition_polynomial.clone(),
-    )?;
-
-    // Calculate composition log degree bound
-    let n_preprocessed_columns = verify_commitment_scheme.trees[0].column_log_sizes.len();
-    let components_vec: Vec<&dyn Component> = vec![&component as &dyn Component];
-    let components = stwo::core::air::Components {
-        components: components_vec,
-        n_preprocessed_columns,
-    };
-    let composition_log_degree_bound = components.composition_log_degree_bound();
-
-    // Get roots and log sizes
-    let roots = vec![proof.commitments[0], proof.commitments[1]];
-    let log_sizes: Vec<Vec<u32>> = component
-        .trace_log_degree_bounds()
-        .iter()
-        .map(|tree| tree.iter().map(|&ls| ls + config.fri_config.log_blowup_factor).collect())
-        .collect();
-
-    println!("  Digest: 0x{}", hex::encode(digest.0));
-    println!("  Composition log degree bound: {}", composition_log_degree_bound);
     println!("  ✅ Off-chain verification successful\n");
 
     // ═══════════════════════════════════════════════════════════
@@ -599,63 +849,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ═══════════════════════════════════════════════════════════
     println!("🔄 STEP 4: Convert Proof to Solidity Format");
 
-    let solidity_proof = convert_to_solidity_proof(proof, composition_polynomial, config);
+    let solidity_proof = convert_to_solidity_proof(
+        proof_data.stark_proof.clone(),
+        composition_polynomial,
+        config.clone(),
+    );
     println!("  ✅ Proof converted to Solidity format\n");
 
     // ═══════════════════════════════════════════════════════════
     // STEP 5: PREPARE VERIFICATION PARAMETERS
     // ═══════════════════════════════════════════════════════════
     println!("📋 STEP 5: Prepare Verification Parameters");
+    let (verification_params, log_sizes, public_inputs) =
+        prepare_onchain_inputs(&proof_data, &offchain, config.clone());
 
-    let component_info = ComponentInfo {
-        maxConstraintLogDegreeBound: component.max_constraint_log_degree_bound(),
-        logSize: component.log_size(),
-        maskOffsets: component
-            .info
-            .mask_offsets
-            .0
-            .iter()
-            .map(|tree| {
-                tree.iter()
-                    .map(|col| col.iter().map(|&offset| offset as i32).collect())
-                    .collect()
-            })
-            .collect(),
-        preprocessedColumns: component
-            .info
-            .preprocessed_columns
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| U256::from(idx))
-            .collect(),
-    };
-
-    let verification_params = VerificationParams {
-        componentParams: vec![ComponentParams {
-            logSize: component.log_size(),
-            claimedSum: QM31 {
-                first: CM31 {
-                    real: component.claimed_sum().0 .0 .0,
-                    imag: component.claimed_sum().0 .1 .0,
-                },
-                second: CM31 {
-                    real: component.claimed_sum().1 .0 .0,
-                    imag: component.claimed_sum().1 .1 .0,
-                },
-            },
-            info: component_info,
-        }],
-        nPreprocessedColumns: U256::from(0),
-        componentsCompositionLogDegreeBound: composition_log_degree_bound,
-    };
-
-    let roots_bytes32: Vec<FixedBytes<32>> =
-        roots.iter().map(|r| FixedBytes::from(r.0)).collect();
-
-    println!("  Component log size: {}", component.log_size());
+    println!("  Component log size: {}", offchain.component.log_size());
     println!(
         "  Max constraint log degree bound: {}",
-        component.max_constraint_log_degree_bound()
+        offchain.component.max_constraint_log_degree_bound()
     );
     println!("  ✅ Parameters prepared\n");
 
@@ -667,10 +878,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = test_contract_verify(
         solidity_proof,
         verification_params,
-        roots_bytes32,
         log_sizes,
-        FixedBytes::from(digest.0),
-        0u32,
+        public_inputs,
     )
     .await
     {
@@ -685,7 +894,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("╚══════════════════════════════════════════════════════════╝\n");
 
     println!("📊 Summary:");
-    println!("  Target: f({}) = {}", target_n, target_value.0);
+    println!("  Target: f({}) = {}", fibonacci_index, target_value);
     println!("  Trace size: 2^{} = {} rows", log_size, 1 << log_size);
     println!("  Security bits: {}", config.security_bits());
     println!("  ✅ Off-chain verification: PASSED");
@@ -694,4 +903,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n🎉 Fibonacci STARK proof generated and verified!");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_fibonacci_onchain_with_public_inputs() {
+        let fibonacci_index = 10;
+        let initial_a = 0;
+        let initial_b = 1;
+        let log_size = calculate_log_size(fibonacci_index);
+
+        let config = PcsConfig {
+            pow_bits: 15,
+            fri_config: StwoFriConfig::new(2, 3, 27),
+        };
+
+        let (proof_data, composition_polynomial) = prove_fibonacci(
+            log_size,
+            fibonacci_index,
+            initial_a,
+            initial_b,
+            config.clone(),
+        )
+        .expect("proof generation failed");
+
+        let offchain =
+            verify_proof_offchain(&proof_data, composition_polynomial.clone(), config.clone())
+                .expect("off-chain verification failed");
+
+        let solidity_proof = convert_to_solidity_proof(
+            proof_data.stark_proof.clone(),
+            composition_polynomial,
+            config.clone(),
+        );
+
+        let (verification_params, log_sizes, public_inputs) =
+            prepare_onchain_inputs(&proof_data, &offchain, config);
+
+        test_contract_verify(
+            solidity_proof,
+            verification_params,
+            log_sizes,
+            public_inputs,
+        )
+        .await
+        .expect("on-chain verification failed");
+    }
 }
