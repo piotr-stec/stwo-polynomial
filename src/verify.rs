@@ -3,13 +3,14 @@ use stwo::core::air::{Component, Components};
 use stwo::core::channel::{Channel, MerkleChannel};
 use stwo::core::circle::CirclePoint;
 use stwo::core::fields::qm31::{SecureField, SECURE_EXTENSION_DEGREE};
+use stwo::core::pcs::utils::get_lifting_log_size;
 use stwo::core::pcs::CommitmentSchemeVerifier;
 use stwo::core::proof::StarkProof;
-use stwo::core::verifier::VerificationError;
+use stwo::core::verifier::{VerificationError, COMPOSITION_LOG_SPLIT};
 use stwo::prover::backend::BackendForChannel;
 use stwo::prover::poly::circle::SecureCirclePoly;
+use std_shims::string::ToString;
 
-use crate::prove::extract_composition_oods_eval;
 pub const PREPROCESSED_TRACE_IDX: usize = 0;
 
 pub fn verify<B: BackendForChannel<MC>, MC: MerkleChannel>(
@@ -17,9 +18,10 @@ pub fn verify<B: BackendForChannel<MC>, MC: MerkleChannel>(
     channel: &mut MC::C,
     commitment_scheme: &mut CommitmentSchemeVerifier<MC>,
     proof: StarkProof<MC::H>,
-    composition_polynomial: SecureCirclePoly<B>,
+    composition_polynomial: &SecureCirclePoly<B>,
+    include_all_preprocessed_columns: bool,
 ) -> Result<(), VerificationError> {
-    let n_preprocessed_columns = commitment_scheme.trees[PREPROCESSED_TRACE_IDX]
+ let n_preprocessed_columns = commitment_scheme.trees[PREPROCESSED_TRACE_IDX]
         .column_log_sizes
         .len();
 
@@ -27,26 +29,47 @@ pub fn verify<B: BackendForChannel<MC>, MC: MerkleChannel>(
         components: components.to_vec(),
         n_preprocessed_columns,
     };
+    let split_composition_log_degree_bound =
+        components.composition_log_degree_bound() - COMPOSITION_LOG_SPLIT;
     tracing::info!(
-        "Composition polynomial log degree bound: {}",
-        components.composition_log_degree_bound()
+        "Split composition polynomial log degree bound: {}",
+        split_composition_log_degree_bound
     );
-    let _random_coeff = channel.draw_secure_felt();
+
+    // If `self.config.lifting_log_size` is None, the lifting size is the length of the split
+    // composition polynomials' domain.
+    let lifting_log_size = get_lifting_log_size(
+        &commitment_scheme.config,
+        split_composition_log_degree_bound + commitment_scheme.config.fri_config.log_blowup_factor,
+    );
+    if include_all_preprocessed_columns {
+        assert!(lifting_log_size >= commitment_scheme.trees[PREPROCESSED_TRACE_IDX].height);
+    }
+
+    // The max degree of a committed polynomial. If `lifting_log_size` is not set,
+    // the largest degree is attained by the splits of the composition polynomial.
+    let max_log_degree_bound =
+        lifting_log_size - commitment_scheme.config.fri_config.log_blowup_factor;
+
+    let random_coeff = channel.draw_secure_felt();
 
     // Read composition polynomial commitment.
     commitment_scheme.commit(
         *proof.commitments.last().unwrap(),
-        &[components.composition_log_degree_bound(); SECURE_EXTENSION_DEGREE],
+        &[max_log_degree_bound; 2 * SECURE_EXTENSION_DEGREE],
         channel,
     );
 
     // Draw OODS point.
     let oods_point = CirclePoint::<SecureField>::get_random_point(channel);
-
     // Get mask sample points relative to oods point.
-    let mut sample_points = components.mask_points(oods_point);
+    let mut sample_points = components.mask_points(
+        oods_point,
+        max_log_degree_bound,
+        include_all_preprocessed_columns,
+    );
     // Add the composition polynomial mask points.
-    sample_points.push(vec![vec![oods_point]; SECURE_EXTENSION_DEGREE]);
+    sample_points.push(vec![vec![oods_point]; 2 * SECURE_EXTENSION_DEGREE]);
 
     let sample_points_by_column = sample_points.as_cols_ref().flatten();
     tracing::info!("Sampling {} columns.", sample_points_by_column.len());
@@ -55,18 +78,15 @@ pub fn verify<B: BackendForChannel<MC>, MC: MerkleChannel>(
         sample_points_by_column.into_iter().flatten().count()
     );
 
-    let composition_oods_eval = extract_composition_oods_eval::<MC>(&proof)
-            .ok_or(VerificationError::InvalidStructure(
-                std_shims::ToString::to_string(&"Unexpected sampled_values structure"),
-            ))?;
 
-    if composition_oods_eval
-        != composition_polynomial.eval_at_point(oods_point)
-    {
+    let composition_oods_eval = proof
+        .extract_composition_oods_eval(oods_point, max_log_degree_bound)
+        .ok_or(VerificationError::InvalidStructure(
+            ToString::to_string(&"Unexpected sampled_values structure"),
+        ))?;
+    if composition_oods_eval != composition_polynomial.eval_at_point(oods_point) {
         return Err(VerificationError::OodsNotMatching);
     }
 
     commitment_scheme.verify_values(sample_points, proof.0, channel)
 }
-
-
