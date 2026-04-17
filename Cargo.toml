@@ -32,15 +32,15 @@ name = "fibonacci_blake"
 path = "examples/fibonacci_blake/src/main.rs"
 
 [dependencies]
-stwo = { path = "../stwo/crates/stwo", features = [
+stwo = { git = "https://github.com/piotr-stec/stwo", branch = "keccak-latest", features = [
     "parallel",
     "prover",
 ], default-features = false }
-stwo-constraint-framework = { path = "../stwo/crates/constraint-framework", features = [
+stwo-constraint-framework = { git = "https://github.com/piotr-stec/stwo", branch = "keccak-latest", features = [
     "parallel",
 ] }
-stwo-air-utils-derive = { path = "../stwo/crates/air-utils-derive" }
-stwo-air-utils = { path = "../stwo/crates/air-utils" }
+stwo-air-utils-derive = { git = "https://github.com/piotr-stec/stwo", branch = "keccak-latest" }
+stwo-air-utils = { git = "https://github.com/piotr-stec/stwo", branch = "keccak-latest" }
 num-traits = "0.2"
 thiserror = { version = "2.0.12", default-features = false }
 tracing = { version = "0.1.40", default-features = false }
